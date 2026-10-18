@@ -16,6 +16,8 @@ DEFAULTS = {
 def settings_path():
     if sys.platform == "win32":
         base = Path(os.environ.get("APPDATA") or Path.home() / "AppData" / "Roaming")
+    elif sys.platform == "darwin":
+        base = Path.home() / "Library" / "Application Support"
     else:
         base = Path(os.environ.get("XDG_CONFIG_HOME") or Path.home() / ".config")
     return base / "mpart" / "settings.json"
@@ -24,7 +26,11 @@ def settings_path():
 def app_dir():
     """Folder containing the executable (or the project, when run from source)."""
     if getattr(sys, "frozen", False):
-        return Path(sys.executable).resolve().parent
+        exe = Path(sys.executable).resolve()
+        # macOS bundles run from mpart.app/Contents/MacOS; use the folder holding mpart.app.
+        if sys.platform == "darwin" and exe.parent.name == "MacOS":
+            return exe.parents[3]
+        return exe.parent
     return Path(__file__).resolve().parent.parent
 
 

@@ -82,6 +82,10 @@ class App:
 
         root.bind("<Unmap>", self._on_unmap)
         root.protocol("WM_DELETE_WINDOW", self.quit)
+        if sys.platform == "darwin":
+            # Dock icon click and Cmd+Q / Dock "Quit".
+            root.createcommand("::tk::mac::ReopenApplication", self.show)
+            root.createcommand("::tk::mac::Quit", self.quit)
         root.after(100, self._poll)
 
     # ---- UI ---------------------------------------------------------------
@@ -437,7 +441,7 @@ class App:
 
     def _tell(self, message, error=False):
         """Show a message in a dialog, or as a tray notification while hidden."""
-        if self.root.state() == "withdrawn":
+        if self.root.state() == "withdrawn" and self.tray.HAS_NOTIFICATION:
             self.tray.notify(message, "mpart: error" if error else APP_NAME)
         elif error:
             messagebox.showerror(APP_NAME, message, parent=self.root)
