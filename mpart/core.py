@@ -1,24 +1,37 @@
-"""Split a file into fixed-size parts and join them back, verified with SHA-256.
+"""Split a file into self-describing ``.mpart`` parts and join them back.
 
-Parts are raw byte slices of the original file named ``<name>.part001``,
-``<name>.part002``, ... alongside a small JSON manifest ``<name>.mpart.json``
-that records the order, size and hash of every part.
+Each part is named ``<filename>.<number>.mpart`` and starts with a fixed-size
+header followed by a raw slice of the original file::
+
+    MAGIC (8 bytes) | header length (uint32 LE) | header JSON | zero padding
+    ... HEADER_SIZE bytes in total, then the payload ...
+
+The header records which split the part belongs to (a random id), the original
+name and size, the part's position, and the SHA-256 of its payload, so a set of
+parts can be found, ordered and verified without any other files. Parts are
+matched by their headers, not their filenames, so renamed parts still join.
 """
 
 import hashlib
 import json
 import re
+import struct
+import uuid
+from dataclasses import dataclass, field
 from pathlib import Path
 
-MANIFEST_SUFFIX = ".mpart.json"
+EXT = ".mpart"
+MAGIC = b"MPART\x00\x01\x00"
 FORMAT_VERSION = 1
+HEADER_SIZE = 4096
+MIN_PART_SIZE = 64 * 1024
 BUF_SIZE = 8 * 1024 * 1024
 
-_PART_RE = re.compile(r"^(?P<name>.+)\.part\d+$")
+_LEN = struct.Struct("<I")
 
 
 class MpartError(Exception):
-    """A user-facing error (missing parts, corruption, bad manifest...)."""
+    """A user-facing error (missing parts, corruption, invalid files...)."""
 
 
 class Cancelled(Exception):
@@ -30,42 +43,126 @@ def _check_cancel(cancel):
         raise Cancelled()
 
 
+# ---- Header ----------------------------------------------------------------
+
+
+@dataclass
+class PartInfo:
+    path: Path
+    id: str
+    name: str
+    size: int
+    index: int
+    count: int
+    length: int
+    sha256: str
+
+
+def _encode_header(fields):
+    data = json.dumps(fields, separators=(",", ":")).encode("ascii")
+    if len(MAGIC) + _LEN.size + len(data) > HEADER_SIZE:
+        raise MpartError("File name is too long to store in a part header.")
+    raw = MAGIC + _LEN.pack(len(data)) + data
+    return raw + b"\0" * (HEADER_SIZE - len(raw))
+
+
+def read_header(path):
+    """Read and validate the header of a ``.mpart`` file."""
+    path = Path(path)
+    try:
+        with path.open("rb") as f:
+            raw = f.read(HEADER_SIZE)
+        actual_length = path.stat().st_size - HEADER_SIZE
+    except OSError as e:
+        raise MpartError(f"{path.name}: could not read ({e.strerror or e})") from e
+
+    if len(raw) < HEADER_SIZE or not raw.startswith(MAGIC):
+        raise MpartError(f"{path.name}: not an mpart file")
+    try:
+        (n,) = _LEN.unpack_from(raw, len(MAGIC))
+        h = json.loads(raw[len(MAGIC) + _LEN.size : len(MAGIC) + _LEN.size + n])
+        if h["v"] != FORMAT_VERSION:
+            raise MpartError(f"{path.name}: unsupported mpart version {h['v']}")
+        info = PartInfo(
+            path=path,
+            id=str(h["id"]),
+            # Only ever use the bare filename so a part can't write elsewhere.
+            name=Path(str(h["name"])).name,
+            size=int(h["size"]),
+            index=int(h["index"]),
+            count=int(h["count"]),
+            length=int(h["length"]),
+            sha256=str(h["sha256"]),
+        )
+    except (ValueError, KeyError, TypeError, struct.error) as e:
+        raise MpartError(f"{path.name}: damaged part header") from e
+    if not info.name or not 1 <= info.index <= info.count:
+        raise MpartError(f"{path.name}: damaged part header")
+    if actual_length != info.length:
+        raise MpartError(f"{path.name}: wrong size (incomplete download?)")
+    return info
+
+
+# ---- Split -----------------------------------------------------------------
+
+
 def part_count(total_size, part_size):
-    return max(1, -(-total_size // part_size))
+    return max(1, -(-total_size // (part_size - HEADER_SIZE)))
 
 
-def manifest_path_for(src, out_dir):
-    return Path(out_dir) / (Path(src).name + MANIFEST_SUFFIX)
+def _part_name(name, index, count):
+    return f"{name}.{index:0{max(3, len(str(count)))}d}{EXT}"
+
+
+def existing_parts(name, out_dir):
+    """Files in ``out_dir`` that look like parts of a file called ``name``."""
+    pattern = re.compile(re.escape(name) + r"\.\d+" + re.escape(EXT) + "$", re.IGNORECASE)
+    out_dir = Path(out_dir)
+    if not out_dir.is_dir():
+        return []
+    return sorted(p for p in out_dir.iterdir() if pattern.match(p.name) and p.is_file())
 
 
 def split_file(src, out_dir, part_size, progress=None, cancel=None):
-    """Split ``src`` into parts of at most ``part_size`` bytes in ``out_dir``.
+    """Split ``src`` into ``.mpart`` files of at most ``part_size`` bytes each.
 
     ``progress(done_bytes, total_bytes)`` is called as data is written and
-    ``cancel`` is an optional ``threading.Event``. Returns the manifest path.
+    ``cancel`` is an optional ``threading.Event``. Returns the part paths.
     """
     src = Path(src)
     out_dir = Path(out_dir)
-    if part_size <= 0:
-        raise ValueError("part_size must be positive")
+    if part_size < MIN_PART_SIZE:
+        raise MpartError(f"Part size must be at least {format_size(MIN_PART_SIZE)}.")
 
     total = src.stat().st_size
+    payload_size = part_size - HEADER_SIZE
     count = part_count(total, part_size)
-    width = max(3, len(str(count)))
+    split_id = uuid.uuid4().hex
     out_dir.mkdir(parents=True, exist_ok=True)
 
-    parts = []
     written = []
     done = 0
     try:
         with src.open("rb") as f:
-            for i in range(1, count + 1):
-                name = f"{src.name}.part{i:0{width}d}"
-                path = out_dir / name
-                remaining = min(part_size, total - done)
+            for index in range(1, count + 1):
+                path = out_dir / _part_name(src.name, index, count)
+                length = min(payload_size, total - done)
+                fields = {
+                    "v": FORMAT_VERSION,
+                    "id": split_id,
+                    "name": src.name,
+                    "size": total,
+                    "index": index,
+                    "count": count,
+                    "length": length,
+                    "sha256": "0" * 64,
+                }
                 h = hashlib.sha256()
                 with path.open("wb") as out:
                     written.append(path)
+                    # Placeholder header; rewritten once the payload hash is known.
+                    out.write(_encode_header(fields))
+                    remaining = length
                     while remaining:
                         _check_cancel(cancel)
                         chunk = f.read(min(BUF_SIZE, remaining))
@@ -77,18 +174,9 @@ def split_file(src, out_dir, part_size, progress=None, cancel=None):
                         done += len(chunk)
                         if progress:
                             progress(done, total)
-                parts.append({"name": name, "size": path.stat().st_size, "sha256": h.hexdigest()})
-
-        manifest = {
-            "mpart": FORMAT_VERSION,
-            "name": src.name,
-            "size": total,
-            "part_size": part_size,
-            "parts": parts,
-        }
-        mpath = manifest_path_for(src, out_dir)
-        written.append(mpath)
-        mpath.write_text(json.dumps(manifest, indent=2), encoding="utf-8")
+                    fields["sha256"] = h.hexdigest()
+                    out.seek(0)
+                    out.write(_encode_header(fields))
     except BaseException:
         for p in written:
             p.unlink(missing_ok=True)
@@ -96,70 +184,104 @@ def split_file(src, out_dir, part_size, progress=None, cancel=None):
 
     if progress:
         progress(total, total)
-    return mpath
+    return written
 
 
-def find_manifest(path):
-    """Return the manifest for ``path``, which may be the manifest or any part."""
-    path = Path(path)
-    if path.name.endswith(MANIFEST_SUFFIX):
-        return path
-    m = _PART_RE.match(path.name)
-    if m:
-        candidate = path.with_name(m.group("name") + MANIFEST_SUFFIX)
-        if candidate.exists():
-            return candidate
-    raise MpartError(f"Could not find a {MANIFEST_SUFFIX} manifest for '{path.name}'.")
+# ---- Join ------------------------------------------------------------------
 
 
-def load_manifest(manifest_path):
-    try:
-        data = json.loads(Path(manifest_path).read_text(encoding="utf-8"))
-    except (OSError, ValueError) as e:
-        raise MpartError(f"Could not read manifest: {e}") from e
-    if not isinstance(data, dict) or data.get("mpart") != FORMAT_VERSION:
-        raise MpartError("Not a supported mpart manifest.")
-    return data
+@dataclass
+class PartSet:
+    """All parts found for one split, keyed by part number."""
+
+    id: str
+    name: str
+    size: int
+    count: int
+    parts: dict = field(default_factory=dict)
+    duplicates: list = field(default_factory=list)
+
+    def add(self, info):
+        if (info.name, info.size, info.count) != (self.name, self.size, self.count):
+            self.duplicates.append(info.path)  # inconsistent header, ignore it
+        elif info.index in self.parts:
+            self.duplicates.append(info.path)  # e.g. "x.001 (1).mpart"
+        else:
+            self.parts[info.index] = info
+
+    @property
+    def missing(self):
+        return [i for i in range(1, self.count + 1) if i not in self.parts]
+
+    @property
+    def complete(self):
+        return not self.missing
+
+    @property
+    def paths(self):
+        return [p.path for p in self.parts.values()] + self.duplicates
+
+    def describe_missing(self):
+        nums = ", ".join(str(i) for i in self.missing[:10])
+        more = "…" if len(self.missing) > 10 else ""
+        return f"{self.name}: missing part(s) {nums}{more} of {self.count}"
 
 
-def output_path_for(manifest_path, out_dir=None):
-    manifest_path = Path(manifest_path)
-    data = load_manifest(manifest_path)
-    # Only ever use the bare filename so a manifest can't write outside out_dir.
-    return Path(out_dir or manifest_path.parent) / Path(data["name"]).name
+def find_sets(directory):
+    """Group every ``.mpart`` file in ``directory`` by split.
 
-
-def join_file(manifest_path, out_dir=None, progress=None, cancel=None):
-    """Reassemble the file described by ``manifest_path`` into ``out_dir``.
-
-    Every part is checked against its recorded size and SHA-256. The output is
-    written to a temporary file and only renamed into place once fully
-    verified. Returns the path of the rebuilt file.
+    Returns ``(sets, problems)`` where ``problems`` lists unreadable files.
     """
-    manifest_path = Path(manifest_path)
-    data = load_manifest(manifest_path)
-    parts_dir = manifest_path.parent
-    out_path = output_path_for(manifest_path, out_dir)
-    total = data["size"]
-
+    sets = {}
     problems = []
-    for part in data["parts"]:
-        p = parts_dir / Path(part["name"]).name
-        if not p.exists():
-            problems.append(f"missing: {part['name']}")
-        elif p.stat().st_size != part["size"]:
-            problems.append(f"wrong size: {part['name']}")
-    if problems:
-        raise MpartError("Cannot join, some parts are not usable:\n" + "\n".join(problems))
+    directory = Path(directory)
+    if not directory.is_dir():
+        raise MpartError(f"Folder not found: {directory}")
+    for path in sorted(directory.iterdir()):
+        if not (path.suffix.lower() == EXT and path.is_file()):
+            continue
+        try:
+            info = read_header(path)
+        except MpartError as e:
+            problems.append(str(e))
+            continue
+        s = sets.get(info.id)
+        if s is None:
+            s = sets[info.id] = PartSet(info.id, info.name, info.size, info.count)
+        s.add(info)
+    return list(sets.values()), problems
 
+
+def find_set_for(part_path):
+    """Find the set that ``part_path`` belongs to, using its own folder."""
+    info = read_header(part_path)
+    sets, _ = find_sets(Path(part_path).parent)
+    for s in sets:
+        if s.id == info.id:
+            return s
+    raise MpartError(f"{Path(part_path).name}: could not find its sibling parts")
+
+
+def join_set(part_set, out_path, progress=None, cancel=None):
+    """Reassemble a complete ``PartSet`` into ``out_path``.
+
+    Every part is checked against its SHA-256. The output is written to a
+    temporary file and only renamed into place once fully verified.
+    """
+    if not part_set.complete:
+        raise MpartError(part_set.describe_missing())
+    out_path = Path(out_path)
     out_path.parent.mkdir(parents=True, exist_ok=True)
-    tmp = out_path.with_name(out_path.name + ".mpart-tmp")
+    tmp = out_path.with_name(out_path.name + ".tmp")
+    total = part_set.size
     done = 0
     try:
         with tmp.open("wb") as out:
-            for part in data["parts"]:
+            for index in range(1, part_set.count + 1):
+                info = part_set.parts[index]
                 h = hashlib.sha256()
-                with (parts_dir / Path(part["name"]).name).open("rb") as f:
+                with info.path.open("rb") as f:
+                    f.seek(HEADER_SIZE)
                     while chunk := f.read(BUF_SIZE):
                         _check_cancel(cancel)
                         out.write(chunk)
@@ -167,13 +289,29 @@ def join_file(manifest_path, out_dir=None, progress=None, cancel=None):
                         done += len(chunk)
                         if progress:
                             progress(done, total)
-                if h.hexdigest() != part["sha256"]:
-                    raise MpartError(f"Part '{part['name']}' is corrupted (checksum mismatch).")
+                if h.hexdigest() != info.sha256:
+                    raise MpartError(f"{info.path.name} is corrupted (checksum mismatch).")
+        if done != total:
+            raise MpartError(f"{part_set.name}: parts don't add up to the original size.")
         tmp.replace(out_path)
     except BaseException:
         tmp.unlink(missing_ok=True)
         raise
     return out_path
+
+
+# ---- Helpers ---------------------------------------------------------------
+
+
+def unique_path(path):
+    """``path`` if it is free, otherwise ``name (2).ext``, ``name (3).ext``..."""
+    path = Path(path)
+    candidate = path
+    n = 2
+    while candidate.exists():
+        candidate = path.with_name(f"{path.stem} ({n}){path.suffix}")
+        n += 1
+    return candidate
 
 
 def format_size(n):

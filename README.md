@@ -3,23 +3,38 @@
 Split large files into smaller parts for services with upload size limits, then
 rebuild the original on the other side.
 
+## Parts
+
+Splitting `movie.mkv` produces `movie.mkv.001.mpart`, `movie.mkv.002.mpart`, ...
+Nothing else is needed: each part starts with a small header recording which
+file it belongs to, its position, and a SHA-256 checksum. On join, mpart checks
+that no part is missing, truncated or corrupted before restoring the original.
+Parts are matched by their headers, so they still join if a download renames
+them.
+
+Each part, header included, is at most the chosen part size. Sizes are decimal
+(1 GB = 1,000,000,000 bytes), which keeps parts under limits quoted as either GB
+or GiB.
+
 ## Usage
 
-- **Split:** pick a file, set a part size (e.g. `2 GB`), pick an output folder.
-  You get `name.part001`, `name.part002`, ... plus `name.mpart.json`.
-  Upload all of them.
-- **Join:** pick the `.mpart.json` manifest, or any part file. Every part is
-  checked against its SHA-256 before the original file is restored.
+- **Quick Split:** choose file(s) and they are split into the Quick Split
+  folder. Dropping files anywhere on the window does the same.
+- **Quick Join:** rebuilds every complete set of parts in the Quick Join folder
+  into that same folder, then deletes the parts. Incomplete sets are reported
+  and left alone.
+- **Split / Join tabs:** the same operations with a folder chosen each time.
+  Manual joins keep the parts.
+- **Settings:** the Quick Split and Quick Join folders (empty means the folder
+  mpart is in) and the part size. Settings are saved to
+  `%APPDATA%\mpart\settings.json`.
 
-Sizes are decimal (1 GB = 1,000,000,000 bytes), which keeps parts under limits
-quoted as either GB or GiB.
+Quick Split and Quick Join are also in the tray icon's right-click menu.
+Minimizing the window hides it to the tray. Closing the window quits.
 
-Minimizing the window hides it to the system tray. Click the tray icon to bring
-it back. Closing the window quits the app.
-
-Parts are plain byte slices, so they can also be joined without mpart, e.g.
-`copy /b name.part001+name.part002 name` on Windows or `cat name.part* > name`
-on Linux and macOS.
+Windows doesn't support dropping files onto tray icons. Instead, drop files onto
+`mpart.exe` or a shortcut to it (e.g. on the desktop): they are handed to the
+running mpart, or mpart starts and splits them.
 
 ## Development
 
