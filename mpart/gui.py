@@ -1,11 +1,12 @@
 """Small Tk GUI for mpart that minimizes to the system tray."""
 
 import queue
+import subprocess
 import sys
 import threading
 import tkinter as tk
 from pathlib import Path
-from tkinter import filedialog, messagebox, ttk
+from tkinter import filedialog, ttk
 
 import pystray
 from PIL import Image, ImageDraw, ImageTk
@@ -37,6 +38,17 @@ def _try_unlink(path):
         return False
 
 
+def reveal(path):
+    """Open the system file manager with ``path`` selected."""
+    if sys.platform == "win32":
+        # Explorer needs the path glued to "/select,"; Windows paths can't contain quotes.
+        subprocess.Popen(f'explorer /select,"{path}"')
+    elif sys.platform == "darwin":
+        subprocess.Popen(["open", "-R", str(path)])
+    else:
+        subprocess.Popen(["xdg-open", str(Path(path).parent)])
+
+
 class App:
     def __init__(self, root, dnd_files_type=None):
         self.root = root
@@ -57,9 +69,19 @@ class App:
         self.quick_join_dir = tk.StringVar(value=saved["quick_join_dir"])
         self.part_size = tk.StringVar(value=saved["part_size"])
         self.part_unit = tk.StringVar(value=saved["part_unit"] if saved["part_unit"] in UNITS else "GB")
+        self.show_after_split = tk.BooleanVar(value=saved["show_after_split"])
+        self.show_after_join = tk.BooleanVar(value=saved["show_after_join"])
+        self._on_yes = None
 
         self._build_ui()
-        for var in (self.quick_split_dir, self.quick_join_dir, self.part_size, self.part_unit):
+        for var in (
+            self.quick_split_dir,
+            self.quick_join_dir,
+            self.part_size,
+            self.part_unit,
+            self.show_after_split,
+            self.show_after_join,
+        ):
             var.trace_add("write", lambda *_: self._schedule_save())
         if dnd_files_type:
             # The plain Tk root lacks the tkdnd methods, but its frame fills the window.
@@ -114,13 +136,19 @@ class App:
         self.quick_split_btn.grid(row=1, column=0, sticky="ew", **pad)
         self.quick_join_btn = ttk.Button(quick, text="Quick Join", command=self.quick_join)
         self.quick_join_btn.grid(row=1, column=1, sticky="ew", **pad)
+        ttk.Checkbutton(quick, text="Show file after quick splitting", variable=self.show_after_split).grid(
+            row=2, column=0, sticky="w", **pad
+        )
+        ttk.Checkbutton(quick, text="Show file after quick joining", variable=self.show_after_join).grid(
+            row=2, column=1, sticky="w", **pad
+        )
         self.quick_split_hint = tk.StringVar()
         self.quick_join_hint = tk.StringVar()
         ttk.Label(quick, textvariable=self.quick_split_hint, wraplength=230, foreground="gray").grid(
-            row=2, column=0, sticky="nw", **pad
+            row=3, column=0, sticky="nw", **pad
         )
         ttk.Label(quick, textvariable=self.quick_join_hint, wraplength=230, foreground="gray").grid(
-            row=2, column=1, sticky="nw", **pad
+            row=3, column=1, sticky="nw", **pad
         )
         self.quick_split_dir.trace_add("write", lambda *_: self._update_hints())
         self.quick_join_dir.trace_add("write", lambda *_: self._update_hints())
@@ -188,13 +216,46 @@ class App:
             foreground="gray",
         ).grid(row=3, column=0, columnspan=3, sticky="w", **pad)
 
+        # Questions are asked in this bar, shown only while one is pending.
+        self.ask_bar = ttk.Frame(frame)
+        self.ask_bar.columnconfigure(0, weight=1)
+        self.ask_text = tk.StringVar()
+        ttk.Label(self.ask_bar, textvariable=self.ask_text, wraplength=380).grid(row=0, column=0, sticky="w")
+        self.ask_yes_btn = ttk.Button(self.ask_bar, command=self._answer_yes)
+        self.ask_yes_btn.grid(row=0, column=1, padx=(6, 0))
+        ttk.Button(self.ask_bar, text="No", command=self._dismiss_ask).grid(row=0, column=2, padx=(6, 0))
+        self.ask_bar.grid(row=1, column=0, columnspan=3, sticky="ew", pady=(10, 0))
+        self.ask_bar.grid_remove()
+
         # Shared progress area
         self.progress = ttk.Progressbar(frame, maximum=1000, length=420)
-        self.progress.grid(row=1, column=0, columnspan=2, sticky="ew", pady=(10, 2))
+        self.progress.grid(row=2, column=0, columnspan=2, sticky="ew", pady=(10, 2))
         self.cancel_btn = ttk.Button(frame, text="Cancel", command=self.cancel.set, state="disabled")
-        self.cancel_btn.grid(row=1, column=2, sticky="e", padx=(6, 0), pady=(10, 2))
+        self.cancel_btn.grid(row=2, column=2, sticky="e", padx=(6, 0), pady=(10, 2))
         self.status = tk.StringVar(value="Ready.")
-        ttk.Label(frame, textvariable=self.status).grid(row=2, column=0, columnspan=3, sticky="w")
+        ttk.Label(frame, textvariable=self.status).grid(row=3, column=0, columnspan=3, sticky="w")
+
+        # Results and errors, newest at the bottom
+        log_box = ttk.Frame(frame)
+        log_box.grid(row=4, column=0, columnspan=3, sticky="ew", pady=(6, 0))
+        log_box.columnconfigure(0, weight=1)
+        self.log = tk.Text(
+            log_box,
+            width=1,  # take the window's width instead of widening it
+            height=6,
+            wrap="word",
+            font="TkDefaultFont",
+            relief="solid",
+            borderwidth=1,
+            highlightthickness=0,
+            state="disabled",
+            takefocus=False,
+        )
+        self.log.grid(row=0, column=0, sticky="ew")
+        scroll = ttk.Scrollbar(log_box, command=self.log.yview)
+        scroll.grid(row=0, column=1, sticky="ns")
+        self.log["yscrollcommand"] = scroll.set
+        self.log.tag_configure("error", foreground="#b91c1c")
 
     def _part_size_widgets(self, parent):
         # Shared variables keep the Split tab and Settings tab in sync.
@@ -217,7 +278,7 @@ class App:
 
     def _on_drop(self, event):
         files = self.root.tk.splitlist(event.data)
-        # Defer so Explorer isn't blocked waiting on any dialog we open.
+        # Defer so the drop returns to Explorer right away.
         self.root.after(10, lambda: self.quick_split_files(files))
         return event.action
 
@@ -254,7 +315,7 @@ class App:
         except (ValueError, OverflowError, KeyError):
             size = 0
         if size < core.MIN_PART_SIZE:
-            self._tell(f"Part size must be at least {core.format_size(core.MIN_PART_SIZE)}.", error=True)
+            self._log(f"Part size must be at least {core.format_size(core.MIN_PART_SIZE)}.", error=True)
             return None
         return size
 
@@ -271,6 +332,8 @@ class App:
                 "quick_join_dir": self.quick_join_dir.get().strip(),
                 "part_size": self.part_size.get().strip(),
                 "part_unit": self.part_unit.get(),
+                "show_after_split": self.show_after_split.get(),
+                "show_after_join": self.show_after_join.get(),
             }
         )
 
@@ -284,33 +347,34 @@ class App:
             self.quick_split_files(paths)
 
     def quick_split_files(self, paths):
-        self._split_files(paths, self._dir(self.quick_split_dir))
+        self._split_files(paths, self._dir(self.quick_split_dir), self.show_after_split.get())
 
     def _start_split(self):
         src = self.split_src.get().strip()
         if not src:
-            self._tell("Choose a file to split.", error=True)
+            self._log("Choose a file to split.", error=True)
             return
         out = self.split_out.get().strip() or str(Path(src).parent)
         self._split_files([src], Path(out))
 
-    def _split_files(self, paths, out_dir):
+    def _split_files(self, paths, out_dir, show=False, confirmed=False):
         if self._busy():
             return
         files = [Path(p) for p in paths]
         bad = [p.name for p in files if not p.is_file() or p.suffix.lower() == core.EXT]
         if bad:
-            self._tell("These can't be split (folders, missing files or existing parts):\n" + "\n".join(bad), True)
+            self._log("These can't be split (folders, missing files or existing parts):\n" + "\n".join(bad), True)
             return
         part_size = self._part_size()
         if part_size is None:
             return
         stale = [old for f in files for old in core.existing_parts(f.name, out_dir)]
-        if stale and not messagebox.askyesno(
-            APP_NAME,
-            f"{len(stale)} existing part file(s) for the same name(s) are already in\n{out_dir}\n\nReplace them?",
-            parent=self.root,
-        ):
+        if stale and not confirmed:
+            self._ask(
+                f"{len(stale)} existing part file(s) for the same name(s) are already in {out_dir}. Replace them?",
+                "Replace",
+                lambda: self._split_files(paths, out_dir, show, confirmed=True),
+            )
             return
 
         def job(progress, status, cancel):
@@ -319,13 +383,16 @@ class App:
             total = sum(f.stat().st_size for f in files)
             base = 0
             lines = []
+            first = None
             for i, f in enumerate(files, 1):
                 size = f.stat().st_size
                 status(f"Splitting {f.name} ({i}/{len(files)})…")
                 parts = core.split_file(f, out_dir, part_size, lambda d, t: progress(base + d, total), cancel)
+                first = first or parts[0]
                 base += size
                 lines.append(f"{f.name} → {len(parts)} part(s)")
-            return f"Split {len(files)} file(s) into {out_dir}\n" + "\n".join(lines), False
+            message = f"Split {len(files)} file(s) into {out_dir}\n" + "\n".join(lines)
+            return message, False, first if show else None
 
         self._run(job)
 
@@ -333,16 +400,17 @@ class App:
         if self._busy():
             return
         folder = self._dir(self.quick_join_dir)
+        show = self.show_after_join.get()
 
         def job(progress, status, cancel):
             status(f"Looking for parts in {folder}…")
             sets, problems = core.find_sets(folder)
             if not sets and not problems:
-                return f"No {core.EXT} files found in {folder}.", True
+                return f"No {core.EXT} files found in {folder}.", True, None
             complete = [s for s in sets if s.complete]
             total = sum(s.size for s in complete)
             base = 0
-            joined = 0
+            joined = []
             lines = []
             for i, s in enumerate(complete, 1):
                 status(f"Joining {s.name} ({i}/{len(complete)})…")
@@ -353,52 +421,53 @@ class App:
                 except core.MpartError as e:
                     lines.append(f"✗ {e}")
                 else:
-                    joined += 1
+                    joined.append(out)
                     kept = [p.name for p in s.paths if not _try_unlink(p)]
                     lines.append(f"✓ {out.name}" + (f" (couldn't delete {len(kept)} part(s))" if kept else ""))
                 base += s.size
             lines += ["✗ " + s.describe_missing() for s in sets if not s.complete]
             lines += ["✗ " + p for p in problems]
-            ok = joined == len(sets) and not problems
-            return f"Joined {joined} file(s) in {folder}\n" + "\n".join(lines), not ok
+            ok = len(joined) == len(sets) and not problems
+            message = f"Joined {len(joined)} file(s) in {folder}\n" + "\n".join(lines)
+            return message, not ok, joined[0] if show and joined else None
 
         self._run(job)
 
-    def _start_join(self):
+    def _start_join(self, confirmed=False):
         if self._busy():
             return
         src = self.join_src.get().strip()
         if not src:
-            self._tell("Choose any part of the file to join.", error=True)
+            self._log("Choose any part of the file to join.", error=True)
             return
         try:
             part_set = core.find_set_for(src)
             if not part_set.complete:
                 raise core.MpartError(part_set.describe_missing())
         except core.MpartError as e:
-            self._tell(str(e), error=True)
+            self._log(str(e), error=True)
             return
         out_path = Path(self.join_out.get().strip() or Path(src).parent) / part_set.name
-        if out_path.exists() and not messagebox.askyesno(
-            APP_NAME, f"{out_path.name} already exists. Overwrite it?", parent=self.root
-        ):
+        if out_path.exists() and not confirmed:
+            self._ask(f"{out_path.name} already exists. Overwrite it?", "Overwrite", lambda: self._start_join(True))
             return
 
         def job(progress, status, cancel):
             status(f"Joining {part_set.name}…")
             path = core.join_set(part_set, out_path, progress, cancel)
-            return f"Rebuilt and verified {path}", False
+            return f"Rebuilt and verified {path}", False, None
 
         self._run(job)
 
     def _busy(self):
         if self.worker and self.worker.is_alive():
-            self._tell("A job is already running. Wait for it to finish or cancel it.", error=True)
+            self._log("A job is already running. Wait for it to finish or cancel it.", error=True)
             return True
         return False
 
     def _run(self, job):
-        """Run ``job(progress, status, cancel) -> (message, is_error)`` on a worker thread."""
+        """Run ``job(progress, status, cancel) -> (message, is_error, path_to_show)`` on a worker thread."""
+        self._dismiss_ask()
         self.cancel.clear()
         self._set_busy(True)
         self.progress["value"] = 0
@@ -412,16 +481,15 @@ class App:
 
         def target():
             try:
-                message, is_error = job(progress, status, self.cancel)
-                self.events.put(("finished", message, is_error))
+                self.events.put(("finished", *job(progress, status, self.cancel)))
             except core.Cancelled:
-                self.events.put(("finished", "Cancelled. Partial output was removed.", False))
+                self.events.put(("finished", "Cancelled. Partial output was removed.", False, None))
             except core.MpartError as e:
-                self.events.put(("finished", str(e), True))
+                self.events.put(("finished", str(e), True, None))
             except OSError as e:
-                self.events.put(("finished", f"{e.strerror or e}: {e.filename or ''}".strip(": "), True))
+                self.events.put(("finished", f"{e.strerror or e}: {e.filename or ''}".strip(": "), True, None))
             except Exception as e:  # keep the GUI alive on unexpected errors
-                self.events.put(("finished", f"Unexpected error: {e!r}", True))
+                self.events.put(("finished", f"Unexpected error: {e!r}", True, None))
 
         self.worker = threading.Thread(target=target, daemon=True)
         self.worker.start()
@@ -432,21 +500,47 @@ class App:
             btn["state"] = state
         self.cancel_btn["state"] = "normal" if busy else "disabled"
 
-    def _finish(self, message, error):
+    def _finish(self, message, error, show):
         self._set_busy(False)
-        self.tray.title = APP_NAME
+        first_line = message.splitlines()[0]
+        # The tray tooltip carries the result while the window is hidden.
+        self.tray.title = f"{APP_NAME}: {first_line}"[:100]
         self.progress["value"] = 0 if error else 1000
-        self.status.set(message.splitlines()[0])
-        self._tell(message, error)
+        self.status.set("Ready.")
+        self._log(message, error)
+        if show:
+            try:
+                reveal(show)
+            except OSError as e:
+                self._log(f"Couldn't open the file manager: {e.strerror or e}", error=True)
 
-    def _tell(self, message, error=False):
-        """Show a message in a dialog, or as a tray notification while hidden."""
-        if self.root.state() == "withdrawn" and self.tray.HAS_NOTIFICATION:
-            self.tray.notify(message, "mpart: error" if error else APP_NAME)
-        elif error:
-            messagebox.showerror(APP_NAME, message, parent=self.root)
-        else:
-            messagebox.showinfo(APP_NAME, message, parent=self.root)
+    # ---- Messages ---------------------------------------------------------
+
+    def _log(self, message, error=False):
+        """Add a message to the log at the bottom of the window."""
+        self.log["state"] = "normal"
+        if self.log.index("end-1c") != "1.0":
+            self.log.insert("end", "\n")
+        self.log.insert("end", message, ("error",) if error else ())
+        self.log["state"] = "disabled"
+        self.log.see("end")
+
+    def _ask(self, question, yes_text, on_yes):
+        """Ask a yes/no question inside the window; ``on_yes`` runs if confirmed."""
+        self.ask_text.set(question)
+        self.ask_yes_btn["text"] = yes_text
+        self._on_yes = on_yes
+        self.ask_bar.grid()
+
+    def _answer_yes(self):
+        on_yes = self._on_yes
+        self._dismiss_ask()
+        if on_yes:
+            on_yes()
+
+    def _dismiss_ask(self):
+        self._on_yes = None
+        self.ask_bar.grid_remove()
 
     # ---- Event loop / tray ------------------------------------------------
 
@@ -466,7 +560,7 @@ class App:
                 elif kind == "status":
                     self.status.set(ev[1])
                 elif kind == "finished":
-                    self._finish(ev[1], ev[2])
+                    self._finish(*ev[1:])
                 elif kind == "show":
                     self.show()
                 elif kind == "quick_split":
@@ -479,8 +573,8 @@ class App:
                     if ev[1]:
                         self.quick_split_files(ev[1])
                 elif kind == "quit":
-                    self.quit()
-                    return
+                    if self.quit():
+                        return
         except queue.Empty:
             pass
         self.root.after(100, self._poll)
@@ -495,11 +589,13 @@ class App:
         self.root.lift()
         self.root.focus_force()
 
-    def quit(self):
+    def quit(self, confirmed=False):
+        """Close the app. Returns False if it is waiting for the user to confirm."""
         if self.worker and self.worker.is_alive():
-            self.show()
-            if not messagebox.askyesno(APP_NAME, "A job is still running. Cancel it and quit?", parent=self.root):
-                return
+            if not confirmed:
+                self.show()
+                self._ask("A job is still running. Cancel it and quit?", "Quit", lambda: self.quit(True))
+                return False
             self.cancel.set()
             self.worker.join(timeout=10)
         if self._save_job:
@@ -507,6 +603,7 @@ class App:
         self._save_settings()
         self.tray.stop()
         self.root.destroy()
+        return True
 
 
 def _enable_dpi_awareness():

@@ -23,15 +23,22 @@ or GiB.
 - **Quick Join:** rebuilds every complete set of parts in the Quick Join folder
   into that same folder, then deletes the parts. Incomplete sets are reported
   and left alone.
+- **Show file after quick splitting / joining:** when ticked, the file manager
+  opens with the result selected (the first part, or the first rebuilt file).
 - **Split / Join tabs:** the same operations with a folder chosen each time.
   Manual joins keep the parts.
 - **Settings:** the Quick Split and Quick Join folders (empty means the folder
-  mpart is in) and the part size. Settings are saved to
+  mpart is in) and the part size. These and the checkboxes are saved to
   `%APPDATA%\mpart\settings.json` on Windows and
   `~/Library/Application Support/mpart/settings.json` on macOS.
 
+mpart never opens message boxes. Results and errors appear in the log at the
+bottom of the window, and questions (such as replacing existing parts) appear
+above the progress bar with buttons to answer them.
+
 Quick Split and Quick Join are also in the tray icon's menu (the menu bar on
-macOS). Minimizing the window hides it to the tray. Closing the window quits.
+macOS). Minimizing the window hides it to the tray; hover over the tray icon to
+see the last result. Closing the window quits.
 
 Tray icons can't accept dropped files. On Windows, drop files onto `mpart.exe`
 or a shortcut to it (e.g. on the desktop) instead: they are handed to the

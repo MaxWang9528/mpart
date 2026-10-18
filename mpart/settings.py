@@ -10,6 +10,8 @@ DEFAULTS = {
     "quick_join_dir": "",
     "part_size": "2",
     "part_unit": "GB",
+    "show_after_split": False,  # open the file manager on the result of a quick split
+    "show_after_join": False,
 }
 
 
